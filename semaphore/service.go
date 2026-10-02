@@ -56,12 +56,19 @@ type pendingAcquire struct {
 // transition, so any instance restart can recover granted permits and the
 // wait queue without double granting or losing available permits.
 type Instance struct {
-	cfg    Config
-	bus    *bus
-	engine *engine
-	w      *wal
+	cfg     Config
+	bus     *bus
+	engine  *engine
+	w       *wal
+	journal *journal
 
 	inbox chan message
+
+	// Per-name ordered execution: every message targeting one semaphore is
+	// processed by one dedicated goroutine, preserving FIFO request order
+	// for that name while different names never block each other.
+	queuesMu sync.Mutex
+	queues   map[string]*nameQueue
 
 	waitsMu sync.Mutex
 	waits   map[string]*pendingAcquire // waiter id -> local waiter
@@ -100,6 +107,7 @@ func NewInstance(cfg Config, b *bus) (*Instance, error) {
 		engine: newEngine(),
 		w:      w,
 		inbox:  make(chan message, 1024),
+		queues: make(map[string]*nameQueue),
 		waits:  make(map[string]*pendingAcquire),
 		hb:     newHeartbeatState(),
 		closed: make(chan struct{}),
@@ -108,6 +116,14 @@ func NewInstance(cfg Config, b *bus) (*Instance, error) {
 		in.engine.compact = func(name string, snap Snapshot) {
 			in.maybeCompact(name, snap)
 		}
+	}
+	if w.dir != "" {
+		j := newJournal(
+			func(name string, evs []Event) error { return w.appendNameEvents(name, evs) },
+			in.maybeCompactJournal,
+		)
+		in.engine.setJournal(j)
+		in.journal = j
 	}
 	if err := in.recoverState(); err != nil {
 		w.Close()
@@ -151,6 +167,20 @@ func (i *Instance) maybeCompact(name string, snap Snapshot) {
 	}
 	if _, evs, err := i.w.readNameExported(name); err == nil && len(evs) >= i.cfg.SnapshotAfter {
 		_ = i.w.saveSnapshot(snap)
+	}
+}
+
+// maybeCompactJournal runs on the per-name journal writer at each drain
+// point: no appends can interleave, so snapshot + log rewrite stay
+// consistent with everything just flushed.
+func (i *Instance) maybeCompactJournal(name string) {
+	if i.cfg.SnapshotAfter <= 0 {
+		return
+	}
+	if n, err := i.w.tailLenLocked(name); err == nil && n >= i.cfg.SnapshotAfter {
+		if snap, ok := i.engine.snapshotAtCompaction(name); ok {
+			_ = i.w.compactLocked(snap)
+		}
 	}
 }
 
@@ -248,17 +278,20 @@ func (i *Instance) Acquire(ctx context.Context, name string, opts AcquireOptions
 }
 
 func (i *Instance) acquireLocal(ctx context.Context, req *request) (*Lease, error) {
+	pa := i.registerWait(req.waiterID, i.cfg.InstanceID)
 	evs, err := i.engine.acquire(req.name, req.holderID, req.waiterID,
 		req.count, req.priority, req.deadline, i.nowNanos(), req.ttl.Nanoseconds(), i.save)
 	if err != nil {
+		i.unregisterWait(req.waiterID)
 		return nil, err
 	}
 	if ls := leasesFromEvents(evs); len(ls) > 0 {
 		l := ls[0]
+		i.unregisterWait(req.waiterID)
 		i.startLeaseHeartbeat(&l)
 		return &l, nil
 	}
-	return i.awaitGrant(ctx, req, i.cfg.InstanceID)
+	return i.awaitRegistered(ctx, req.waiterID, pa)
 }
 
 func (i *Instance) acquireRemote(ctx context.Context, owner string, req *request) (*Lease, error) {
@@ -413,6 +446,9 @@ func (i *Instance) Close() error {
 	i.closeOnce.Do(func() {
 		close(i.closed)
 		i.bus.unregister(i.cfg.InstanceID)
+		if i.journal != nil {
+			i.journal.close()
+		}
 		err = i.w.Close()
 	})
 	return err
@@ -478,13 +514,104 @@ func (i *Instance) scheduleAbortedAcquireCleanup(req *request, owner string) {
 
 // ---- owner-side server loop ----
 
+// msgName resolves the semaphore a message targets. Cancel messages carry
+// no name; the owner resolves it through the live waiter index.
+func (i *Instance) msgName(m message) string {
+	if m.req.name != "" {
+		return m.req.name
+	}
+	if m.req.op == "cancel" {
+		return i.engine.waiterOwner(m.req.waiterID)
+	}
+	return ""
+}
+
 func (i *Instance) serve() {
 	for {
 		select {
 		case <-i.closed:
 			return
 		case m := <-i.inbox:
-			i.handle(m)
+			// Client-targeted control messages (grant push, waiter timeout)
+			// never touch owner state: answer immediately.
+			if m.req.op == "notify" || m.req.op == "waittimeout" {
+				i.handle(m)
+				continue
+			}
+			name := i.msgName(m)
+			if name == "" {
+				// Unknown target (e.g. already-canceled waiter): idempotent.
+				i.handle(m)
+				continue
+			}
+			i.dispatch(name, m)
+		}
+	}
+}
+
+func (i *Instance) dispatch(name string, m message) {
+	i.queuesMu.Lock()
+	q, ok := i.queues[name]
+	if !ok {
+		q = &nameQueue{wake: make(chan struct{}, 1)}
+		i.queues[name] = q
+		go i.serveName(name, q)
+	}
+	i.queuesMu.Unlock()
+	if !q.push(m) {
+		m.res <- response{err: ErrClosed}
+	}
+}
+
+// nameQueue is an unbounded, single-consumer FIFO. push never blocks the
+// central serve loop, yet messages for one name are consumed in order.
+type nameQueue struct {
+	mu     sync.Mutex
+	closed bool
+	buf    []message
+	wake   chan struct{}
+}
+
+func (q *nameQueue) push(m message) bool {
+	q.mu.Lock()
+	if q.closed {
+		q.mu.Unlock()
+		return false
+	}
+	q.buf = append(q.buf, m)
+	q.mu.Unlock()
+	select {
+	case q.wake <- struct{}{}:
+	default:
+	}
+	return true
+}
+
+func (q *nameQueue) drainOne() (message, bool) {
+	q.mu.Lock()
+	if len(q.buf) > 0 {
+		m := q.buf[0]
+		q.buf = q.buf[1:]
+		q.mu.Unlock()
+		return m, true
+	}
+	q.mu.Unlock()
+	return message{}, false
+}
+
+func (i *Instance) serveName(name string, q *nameQueue) {
+	for {
+		select {
+		case <-i.closed:
+			return
+		case <-q.wake:
+			for {
+				m, ok := q.drainOne()
+				if !ok {
+					break
+				}
+				i.handle(m)
+			}
 		}
 	}
 }
@@ -538,8 +665,8 @@ func (i *Instance) handle(m message) {
 		l := &Lease{Semaphore: req.name, HolderID: req.holderID, Fence: ev.Fence, Count: ev.Count, ExpiresAt: time.Unix(0, ev.ExpiresAt)}
 		m.res <- response{lease: l, ack: true}
 	case "cancel":
-		// Find the semaphore for this waiter across owned semaphores.
-		name := i.findWaiterSemaphore(req.waiterID)
+		// Resolve the semaphore for this waiter through the live index.
+		name := i.engine.waiterOwner(req.waiterID)
 		if name == "" {
 			m.res <- response{ack: true} // already gone: idempotent
 			return
@@ -664,19 +791,6 @@ func (i *Instance) pushToWaiter(waiterID string, l *Lease) bool {
 	}
 }
 
-func (i *Instance) findWaiterSemaphore(waiterID string) string {
-	for _, name := range i.engine.names() {
-		if snap, ok := i.engine.snapshot(name); ok {
-			for _, w := range snap.Waiters {
-				if w.ID == waiterID {
-					return name
-				}
-			}
-		}
-	}
-	return ""
-}
-
 // ---- background lease reaping ----
 
 func (i *Instance) tickLoop() {
@@ -702,7 +816,7 @@ func (i *Instance) tick() {
 		// waiters atomically.
 		for _, wid := range waiters {
 			evs, err := i.engine.expire(name, wid, true, now, i.cfg.DefaultLeaseTTL.Nanoseconds(), i.save)
-			if err == nil {
+			if err == nil && len(evs) > 0 {
 				i.failWaiter(wid, ErrAcquireTimeout)
 				i.notifyGrants(evs)
 			}

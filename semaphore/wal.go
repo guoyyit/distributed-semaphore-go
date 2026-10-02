@@ -21,8 +21,9 @@ import (
 // is fsynced before the caller applies the events to memory, so an instance
 // crash never loses a granted permit nor keeps a released one.
 type wal struct {
-	dir string
-	mu  sync.Mutex
+	dir   string
+	mu    sync.Mutex // guards locks map
+	locks map[string]*sync.Mutex
 }
 
 type snapshotEnvelope struct {
@@ -37,7 +38,20 @@ func openWAL(dir string) (*wal, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
-	return &wal{dir: dir}, nil
+	return &wal{dir: dir, locks: make(map[string]*sync.Mutex)}, nil
+}
+
+// lockFor returns the mutex serializing all file mutations for one name.
+// Different semaphore names persist and compact independently.
+func (w *wal) lockFor(name string) *sync.Mutex {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	l, ok := w.locks[name]
+	if !ok {
+		l = &sync.Mutex{}
+		w.locks[name] = l
+	}
+	return l
 }
 
 func (w *wal) eventFile(name string) string {
@@ -52,8 +66,6 @@ func (w *wal) append(evs []Event) error {
 	if len(evs) == 0 || w.dir == "" {
 		return nil
 	}
-	w.mu.Lock()
-	defer w.mu.Unlock()
 	// Group by name; within each group sequences are contiguous.
 	byName := map[string][]Event{}
 	var order []string
@@ -63,6 +75,19 @@ func (w *wal) append(evs []Event) error {
 		}
 		byName[ev.Name] = append(byName[ev.Name], ev)
 	}
+	sort.Strings(order)
+	locks := make([]*sync.Mutex, 0, len(order))
+	for _, name := range order {
+		locks = append(locks, w.lockFor(name))
+	}
+	for _, l := range locks {
+		l.Lock()
+	}
+	defer func() {
+		for _, l := range locks {
+			l.Unlock()
+		}
+	}()
 	for _, name := range order {
 		if err := w.appendName(name, byName[name]); err != nil {
 			return err
@@ -96,16 +121,30 @@ func (w *wal) appendName(name string, evs []Event) error {
 	return f.Sync()
 }
 
+// appendNameEvents durably appends one name's contiguous event batch. It is
+// the single entry point used by the per-name journal writer, so all
+// mutations of one name's log are serialized without blocking other names.
+func (w *wal) appendNameEvents(name string, evs []Event) error {
+	if w.dir == "" || len(evs) == 0 {
+		return nil
+	}
+	l := w.lockFor(name)
+	l.Lock()
+	defer l.Unlock()
+	return w.appendName(name, evs)
+}
+
 // sinceSnapshot returns the maximum post-snapshot event count across names.
 func (w *wal) sinceSnapshot() int {
 	if w.dir == "" {
 		return 0
 	}
-	w.mu.Lock()
-	defer w.mu.Unlock()
 	max := 0
 	for _, name := range w.listNames() {
+		l := w.lockFor(name)
+		l.Lock()
 		_, evs, err := w.readName(name)
+		l.Unlock()
 		if err != nil {
 			continue
 		}
@@ -122,8 +161,15 @@ func (w *wal) saveSnapshot(s Snapshot) error {
 	if w.dir == "" {
 		return nil
 	}
-	w.mu.Lock()
-	defer w.mu.Unlock()
+	l := w.lockFor(s.Name)
+	l.Lock()
+	defer l.Unlock()
+	return w.saveSnapshotLocked(s)
+}
+
+// saveSnapshotLocked performs snapshot + log rewrite assuming the caller
+// (the per-name journal writer) already holds the name lock.
+func (w *wal) saveSnapshotLocked(s Snapshot) error {
 	b, err := json.Marshal(snapshotEnvelope{Version: 1, Snap: s})
 	if err != nil {
 		return err
@@ -191,12 +237,13 @@ func (w *wal) loadAll() ([]Snapshot, []Event, error) {
 	if w.dir == "" {
 		return nil, nil, nil
 	}
-	w.mu.Lock()
-	defer w.mu.Unlock()
 	var snaps []Snapshot
 	var evs []Event
 	for _, name := range w.listNames() {
+		l := w.lockFor(name)
+		l.Lock()
 		snap, nameEvs, err := w.readName(name)
+		l.Unlock()
 		if err != nil {
 			return nil, nil, err
 		}
@@ -311,7 +358,22 @@ func unsanitize(tok string) (string, error) {
 
 // readNameExported exposes post-snapshot events for snapshot policy checks.
 func (w *wal) readNameExported(name string) (*Snapshot, []Event, error) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
+	l := w.lockFor(name)
+	l.Lock()
+	defer l.Unlock()
 	return w.readName(name)
 }
+
+// tailLenLocked returns the post-snapshot event count; caller holds the
+// per-name lock (journal writer compaction path).
+func (w *wal) tailLenLocked(name string) (int, error) {
+	_, evs, err := w.readName(name)
+	if err != nil {
+		return 0, err
+	}
+	return len(evs), nil
+}
+
+// compactLocked writes the snapshot and rewrites the tail while the caller
+// already holds the per-name lock.
+func (w *wal) compactLocked(snap Snapshot) error { return w.saveSnapshotLocked(snap) }

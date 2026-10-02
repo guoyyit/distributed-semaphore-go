@@ -7,9 +7,7 @@ import "sort"
 // re-push exactly the grants whose delivery was never confirmed, without
 // granting the same permits twice.
 func (e *engine) markNotified(name, waiterID string, fence int64, now int64, save saver) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	s, ok := e.sems[name]
+	s, ok := e.stateLocked(name)
 	if !ok {
 		return ErrUnknownSemaphore
 	}
@@ -18,21 +16,25 @@ func (e *engine) markNotified(name, waiterID string, fence int64, now int64, sav
 			continue
 		}
 		if h.Fence != fence || s.notified[fence] {
+			s.mu.Unlock()
 			return nil // superseded by renewal, or already confirmed
 		}
 		ev := Event{Seq: s.eventSeq + 1, At: now, Type: evNotified, Name: name, WaiterID: waiterID, Fence: fence}
-		_, err := e.commit([]Event{ev}, nil, save)
+		_, err := e.commit(s, []Event{ev})
 		return err
 	}
+	s.mu.Unlock()
 	return nil
 }
 
 // pendingGrants lists queue grants not yet confirmed as delivered.
 func (e *engine) pendingGrants() []pendingGrant {
-	e.mu.Lock()
-	defer e.mu.Unlock()
 	var out []pendingGrant
-	for _, s := range e.sems {
+	for _, name := range e.names() {
+		s, ok := e.stateLocked(name)
+		if !ok {
+			continue
+		}
 		for _, h := range s.holders {
 			if h.WaiterID == "" || s.notified[h.Fence] {
 				continue
@@ -42,6 +44,7 @@ func (e *engine) pendingGrants() []pendingGrant {
 				fence: h.Fence, count: h.Count, expiresAt: h.ExpiresAt,
 			})
 		}
+		s.mu.Unlock()
 	}
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].name != out[j].name {
