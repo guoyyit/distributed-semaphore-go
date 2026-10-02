@@ -1,6 +1,7 @@
 package semaphore
 
 import (
+	"fmt"
 	"sort"
 	"sync"
 	"time"
@@ -9,14 +10,17 @@ import (
 // engine holds the in-memory state of all semaphores owned by one instance.
 //
 // Concurrency/consistency model:
-//   - Every state transition is planned as one or more Events while the
-//     engine mutex is held. Planning is pure: it never mutates state.
-//   - Still holding the mutex, the owner durably persists the batch via the
-//     save callback. If persistence fails, nothing has changed.
-//   - Only after a successful save are events applied. State therefore never
-//     reflects a transition that was not durably logged, and a recycle plus
-//     the grants it enables commit as one atomic batch: permit accounting
-//     and the wait queue can never disagree.
+//   - Every state transition is planned while the engine mutex is held.
+//     Planning mutates in-memory state directly (used, holders, waiters,
+//     queue) so concurrent planners always observe the latest decision;
+//     this is what prevents overselling when commits run in parallel.
+//   - Still holding the mutex, the planner snapshots the affected state.
+//   - The mutex is then released and the batch is durably persisted via the
+//     save callback (group-committed, fsynced). If persistence fails, the
+//     snapshot is restored: state never reflects a transition that was not
+//     durably logged.
+//   - Planning and replay apply the same mutations, so the in-memory state
+//     always equals the replayed log state.
 type engine struct {
 	mu      sync.Mutex
 	sems    map[string]*semaState
@@ -41,7 +45,8 @@ func newEngine() *engine {
 	return &engine{sems: make(map[string]*semaState)}
 }
 
-// saver persists an event batch; engine applies events only if it succeeds.
+// saver persists an event batch; the engine releases its lock during the
+// call and re-acquires it only to roll back on failure.
 type saver func(evs []Event) error
 
 // leasesFromEvents extracts granted leases from a committed event batch.
@@ -61,81 +66,135 @@ func leasesFromEvents(evs []Event) []Lease {
 	return out
 }
 
-// commit plans a batch, persists it, then applies it atomically.
-func (e *engine) commit(evs []Event, err error, save saver) ([]Event, error) {
-	if err != nil {
-		return nil, err
+// semaStateFromSnapshot rebuilds state from a durable snapshot.
+func semaStateFromSnapshot(snap Snapshot) *semaState {
+	s := &semaState{
+		name: snap.Name, permits: snap.Permits, strategy: snap.Strategy,
+		fenceSeq: snap.FenceSeq, eventSeq: snap.Seq,
+		holders: map[string]*Holder{}, waiters: map[string]*Waiter{},
+		notified: map[int64]bool{},
 	}
-	if len(evs) == 0 || save == nil {
-		return evs, nil
+	for _, f := range snap.Notified {
+		s.notified[f] = true
 	}
-	if err := save(evs); err != nil {
-		return nil, err
+	for i := range snap.Holders {
+		h := snap.Holders[i]
+		s.holders[h.ID] = &h
+		s.used += h.Count
 	}
-	for _, ev := range evs {
-		e.applyLocked(ev)
+	for i := range snap.Waiters {
+		w := snap.Waiters[i]
+		s.waiters[w.ID] = &w
+		s.queue = append(s.queue, w.ID)
 	}
-	if e.compact != nil {
-		seen := map[string]bool{}
-		for _, ev := range evs {
-			if seen[ev.Name] {
-				continue
-			}
-			seen[ev.Name] = true
-			if st, ok := e.sems[ev.Name]; ok {
-				e.compact(ev.Name, st.deepSnapshot())
-			}
-		}
+	sort.SliceStable(s.queue, func(i, j int) bool {
+		return s.waiters[s.queue[i]].Seq < s.waiters[s.queue[j]].Seq
+	})
+	return s
+}
+
+// rollback restores a semaphore's state after a failed persistence.
+func (e *engine) rollback(name string, snap Snapshot) {
+	e.mu.Lock()
+	e.sems[name] = semaStateFromSnapshot(snap)
+	e.mu.Unlock()
+}
+
+// afterCommit runs the optional compaction hook after a successful commit.
+// Invoked without the engine lock.
+func (e *engine) afterCommit(name string) {
+	if e.compact == nil {
+		return
 	}
-	return evs, nil
+	e.mu.Lock()
+	s, ok := e.sems[name]
+	e.mu.Unlock()
+	if ok {
+		e.compact(name, s.deepSnapshot())
+	}
 }
 
 // create is idempotent: creating an existing identical semaphore is a no-op.
 func (e *engine) create(name string, permits int, strategy Strategy, now int64, save saver) ([]Event, error) {
 	e.mu.Lock()
-	defer e.mu.Unlock()
 	if permits < 0 {
+		e.mu.Unlock()
 		return nil, ErrInvalidPermitCount
 	}
 	if s, ok := e.sems[name]; ok {
 		if s.permits != permits || s.strategy != strategy {
+			e.mu.Unlock()
 			return nil, ErrUnknownSemaphore
 		}
+		e.mu.Unlock()
 		return nil, nil
 	}
 	ev := Event{Seq: 1, At: now, Type: evCreated, Name: name, Permits: permits, Strategy: strategy}
-	return e.commit([]Event{ev}, nil, save)
+	e.sems[name] = &semaState{
+		name: name, permits: permits, strategy: strategy,
+		fenceSeq: 0, eventSeq: ev.Seq,
+		holders: map[string]*Holder{}, waiters: map[string]*Waiter{},
+		notified: map[int64]bool{},
+	}
+	e.mu.Unlock()
+	if err := save([]Event{ev}); err != nil {
+		e.mu.Lock()
+		delete(e.sems, name)
+		e.mu.Unlock()
+		return nil, err
+	}
+	e.afterCommit(name)
+	return []Event{ev}, nil
 }
 
 // acquire either grants immediately (queue empty and enough free permits) or
 // enqueues the whole request. Partial grants never happen.
 func (e *engine) acquire(name, holderID, waiterID string, count, priority int, deadline, now, ttlNanos int64, save saver) ([]Event, error) {
 	e.mu.Lock()
-	defer e.mu.Unlock()
-	if count <= 0 {
-		return nil, ErrInvalidPermitCount
-	}
 	s, ok := e.sems[name]
 	if !ok {
+		e.mu.Unlock()
 		return nil, ErrUnknownSemaphore
 	}
-	var evs []Event
+	if count <= 0 {
+		e.mu.Unlock()
+		return nil, ErrInvalidPermitCount
+	}
+	snap := s.deepSnapshot()
+	evs := s.planAcquire(holderID, waiterID, count, priority, deadline, now, ttlNanos)
+	e.mu.Unlock()
+	if err := save(evs); err != nil {
+		e.rollback(name, snap)
+		return nil, err
+	}
+	e.afterCommit(name)
+	return evs, nil
+}
+
+// planAcquire mutates state and returns the event to persist. Caller holds e.mu.
+func (s *semaState) planAcquire(holderID, waiterID string, count, priority int, deadline, now, ttlNanos int64) []Event {
 	if len(s.queue) == 0 && s.used+count <= s.permits {
 		fence := s.fenceSeq + 1
+		s.fenceSeq = fence
+		s.used += count
+		s.holders[holderID] = &Holder{ID: holderID, Fence: fence, Count: count, ExpiresAt: now + ttlNanos}
 		ev := Event{
-			Seq: s.eventSeq + 1, At: now, Type: evAcquired, Name: name,
+			Seq: s.eventSeq + 1, At: now, Type: evAcquired, Name: s.name,
 			HolderID: holderID, Fence: fence, Count: count, ExpiresAt: now + ttlNanos,
 		}
-		evs = []Event{ev}
-	} else {
-		ev := Event{
-			Seq: s.eventSeq + 1, At: now, Type: evQueued, Name: name,
-			WaiterID: waiterID, HolderID: holderID, Count: count,
-			Priority: priority, Deadline: deadline, WaiterSeq: s.eventSeq + 1,
-		}
-		evs = []Event{ev}
+		s.eventSeq = ev.Seq
+		return []Event{ev}
 	}
-	return e.commit(evs, nil, save)
+	w := &Waiter{ID: waiterID, HolderID: holderID, Count: count, Priority: priority, Deadline: deadline, Seq: s.eventSeq + 1}
+	s.waiters[waiterID] = w
+	s.queue = append(s.queue, waiterID)
+	ev := Event{
+		Seq: s.eventSeq + 1, At: now, Type: evQueued, Name: s.name,
+		WaiterID: waiterID, HolderID: holderID, Count: count,
+		Priority: priority, Deadline: deadline, WaiterSeq: w.Seq,
+	}
+	s.eventSeq = ev.Seq
+	return []Event{ev}
 }
 
 // release returns permits. Idempotent:
@@ -145,20 +204,31 @@ func (e *engine) acquire(name, holderID, waiterID string, count, priority int, d
 // Waiters made serviceable are granted within the same atomic batch.
 func (e *engine) release(name, holderID string, fence, now, ttlNanos int64, save saver) ([]Event, bool, error) {
 	e.mu.Lock()
-	defer e.mu.Unlock()
 	s, ok := e.sems[name]
 	if !ok {
+		e.mu.Unlock()
 		return nil, false, ErrUnknownSemaphore
 	}
 	h, ok := s.holders[holderID]
 	if !ok {
+		fmt.Printf("DEBUG release holder NOT FOUND name=%s holder=%s\n", name, holderID)
+		e.mu.Unlock()
 		return nil, true, nil // idempotent no-op
 	}
 	if h.Fence != fence {
+		e.mu.Unlock()
 		return nil, false, ErrStaleFencingToken
 	}
-	evs, err := e.commit(s.planRecycle([]string{holderID}, nil, now, ttlNanos), nil, save)
-	return evs, true, err
+	snap := s.deepSnapshot()
+	evs := s.planRecycle([]string{holderID}, nil, now, ttlNanos)
+	fmt.Printf("DEBUG release FREED holder=%s evs=%d\n", holderID, len(evs))
+	e.mu.Unlock()
+	if err := save(evs); err != nil {
+		e.rollback(name, snap)
+		return nil, false, err
+	}
+	e.afterCommit(name)
+	return evs, true, nil
 }
 
 // releaseHolder returns a holder's permits without requiring a known fencing
@@ -167,80 +237,137 @@ func (e *engine) release(name, holderID string, fence, now, ttlNanos int64, save
 // serviceable waiters in the same atomic batch.
 func (e *engine) releaseHolder(name, holderID string, now, ttlNanos int64, save saver) ([]Event, bool, error) {
 	e.mu.Lock()
-	defer e.mu.Unlock()
 	s, ok := e.sems[name]
 	if !ok {
+		e.mu.Unlock()
 		return nil, false, ErrUnknownSemaphore
 	}
 	if _, ok := s.holders[holderID]; !ok {
+		e.mu.Unlock()
 		return nil, true, nil
 	}
-	evs, err := e.commit(s.planRecycle([]string{holderID}, nil, now, ttlNanos), nil, save)
-	return evs, true, err
+	snap := s.deepSnapshot()
+	evs := s.planRecycle([]string{holderID}, nil, now, ttlNanos)
+	e.mu.Unlock()
+	if err := save(evs); err != nil {
+		e.rollback(name, snap)
+		return nil, false, err
+	}
+	e.afterCommit(name)
+	return evs, true, nil
 }
 
 // renew validates the latest fencing token, extends the deadline and rotates
 // to a fresh token. The old token can never be used again.
 func (e *engine) renew(name, holderID string, fence, deadline, now int64, save saver) (Event, error) {
 	e.mu.Lock()
-	defer e.mu.Unlock()
 	s, ok := e.sems[name]
 	if !ok {
+		e.mu.Unlock()
 		return Event{}, ErrUnknownSemaphore
 	}
 	h, ok := s.holders[holderID]
 	if !ok || h.Fence != fence {
+		e.mu.Unlock()
 		return Event{}, ErrStaleFencingToken
 	}
+	snap := s.deepSnapshot()
+	ev := s.planRenew(h, deadline, now)
+	e.mu.Unlock()
+	if err := save([]Event{ev}); err != nil {
+		e.rollback(name, snap)
+		return Event{}, err
+	}
+	e.afterCommit(name)
+	return ev, nil
+}
+
+func (s *semaState) planRenew(h *Holder, deadline, now int64) Event {
+	fence := s.fenceSeq + 1
+	s.fenceSeq = fence
+	h.Fence = fence
+	h.ExpiresAt = deadline
 	ev := Event{
-		Seq: s.eventSeq + 1, At: now, Type: evRenewed, Name: name,
-		HolderID: h.ID, OldFence: fence, Fence: s.fenceSeq + 1,
+		Seq: s.eventSeq + 1, At: now, Type: evRenewed, Name: s.name,
+		HolderID: h.ID, OldFence: h.Fence, Fence: fence,
 		Count: h.Count, ExpiresAt: deadline,
 	}
-	_, err := e.commit([]Event{ev}, nil, save)
-	return ev, err
+	s.eventSeq = ev.Seq
+	return ev
 }
 
 // cancel removes a queued waiter. Idempotent when the waiter was already
 // granted, canceled or expired: no event, no error, no resource change.
 func (e *engine) cancel(name, waiterID string, now int64, save saver) (bool, error) {
 	e.mu.Lock()
-	defer e.mu.Unlock()
 	s, ok := e.sems[name]
 	if !ok {
+		e.mu.Unlock()
 		return false, ErrUnknownSemaphore
 	}
 	w, ok := s.waiters[waiterID]
 	if !ok {
+		e.mu.Unlock()
 		return false, nil
 	}
-	ev := Event{Seq: s.eventSeq + 1, At: now, Type: evDequeued, Name: name, WaiterID: w.ID}
-	_, err := e.commit([]Event{ev}, nil, save)
-	return true, err
+	snap := s.deepSnapshot()
+	ev := s.planCancel(w, now)
+	e.mu.Unlock()
+	if err := save([]Event{ev}); err != nil {
+		e.rollback(name, snap)
+		return false, err
+	}
+	e.afterCommit(name)
+	return true, nil
+}
+
+func (s *semaState) planCancel(w *Waiter, now int64) Event {
+	delete(s.waiters, w.ID)
+	s.removeFromQueue(w.ID)
+	ev := Event{Seq: s.eventSeq + 1, At: now, Type: evDequeued, Name: s.name, WaiterID: w.ID}
+	s.eventSeq = ev.Seq
+	return ev
 }
 
 // expire reaps one expired holder lease or one timed-out waiter. Holder
 // permits are recycled and serviceable waiters are granted in one batch.
 func (e *engine) expire(name, id string, isWaiter bool, now, ttlNanos int64, save saver) ([]Event, error) {
 	e.mu.Lock()
-	defer e.mu.Unlock()
 	s, ok := e.sems[name]
 	if !ok {
+		e.mu.Unlock()
 		return nil, ErrUnknownSemaphore
 	}
 	if isWaiter {
 		w, ok := s.waiters[id]
 		if !ok || w.Deadline == 0 || w.Deadline > now {
+			e.mu.Unlock()
 			return nil, nil
 		}
-		ev := Event{Seq: s.eventSeq + 1, At: now, Type: evDequeued, Name: name, WaiterID: w.ID}
-		return e.commit([]Event{ev}, nil, save)
+		snap := s.deepSnapshot()
+		ev := s.planCancel(w, now)
+		e.mu.Unlock()
+		if err := save([]Event{ev}); err != nil {
+			e.rollback(name, snap)
+			return nil, err
+		}
+		e.afterCommit(name)
+		return []Event{ev}, nil
 	}
 	h, ok := s.holders[id]
 	if !ok || h.ExpiresAt > now {
+		e.mu.Unlock()
 		return nil, nil
 	}
-	return e.commit(s.planRecycle([]string{id}, nil, now, ttlNanos), nil, save)
+	snap := s.deepSnapshot()
+	evs := s.planRecycle([]string{id}, nil, now, ttlNanos)
+	e.mu.Unlock()
+	if err := save(evs); err != nil {
+		e.rollback(name, snap)
+		return nil, err
+	}
+	e.afterCommit(name)
+	return evs, nil
 }
 
 // preempt forcibly revokes holders (to admit high-priority waiters). Revoked
@@ -248,9 +375,9 @@ func (e *engine) expire(name, id string, isWaiter bool, now, ttlNanos int64, sav
 // offered to the queue in the same atomic batch.
 func (e *engine) preempt(name string, holderIDs []string, now, ttlNanos int64, save saver) ([]Event, error) {
 	e.mu.Lock()
-	defer e.mu.Unlock()
 	s, ok := e.sems[name]
 	if !ok {
+		e.mu.Unlock()
 		return nil, ErrUnknownSemaphore
 	}
 	var live []string
@@ -260,13 +387,23 @@ func (e *engine) preempt(name string, holderIDs []string, now, ttlNanos int64, s
 		}
 	}
 	if len(live) == 0 {
+		e.mu.Unlock()
 		return nil, nil
 	}
-	return e.commit(s.planRecycle(live, nil, now, ttlNanos), nil, save)
+	snap := s.deepSnapshot()
+	evs := s.planRecycle(live, nil, now, ttlNanos)
+	e.mu.Unlock()
+	if err := save(evs); err != nil {
+		e.rollback(name, snap)
+		return nil, err
+	}
+	e.afterCommit(name)
+	return evs, nil
 }
 
 // planRecycle builds an atomic batch: release events for holders, dequeue
-// events for waiters, then grants for every waiter that fits. Pure.
+// events for waiters, then grants for every waiter that fits. Pure planning
+// that mutates state directly; caller holds e.mu.
 func (s *semaState) planRecycle(holders []string, waiters []string, now, ttlNanos int64) []Event {
 	removedWaiters := map[string]bool{}
 	seq := s.eventSeq
@@ -326,10 +463,45 @@ func (s *semaState) planRecycle(holders []string, waiters []string, now, ttlNano
 			Count: w.Count, ExpiresAt: now + ttlNanos,
 		})
 	}
+
+	// Apply the planned mutations to in-memory state so concurrent planners
+	// observe the post-recycle world.
+	for _, id := range holders {
+		if h, ok := s.holders[id]; ok {
+			s.used -= h.Count
+			if s.used < 0 {
+				s.used = 0
+			}
+			delete(s.holders, id)
+		}
+	}
+	for _, id := range waiters {
+		if _, ok := s.waiters[id]; ok {
+			delete(s.waiters, id)
+			s.removeFromQueue(id)
+		}
+	}
+	for _, ev := range evs {
+		if ev.Type != evGranted {
+			continue
+		}
+		if _, dup := s.holders[ev.HolderID]; dup {
+			continue
+		}
+		delete(s.waiters, ev.WaiterID)
+		s.removeFromQueue(ev.WaiterID)
+		s.holders[ev.HolderID] = &Holder{ID: ev.HolderID, WaiterID: ev.WaiterID, Fence: ev.Fence, Count: ev.Count, ExpiresAt: ev.ExpiresAt}
+		s.used += ev.Count
+	}
+	if fence > s.fenceSeq {
+		s.fenceSeq = fence
+	}
+	s.eventSeq = seq
 	return evs
 }
 
 // applyLocked mutates state for an already-persisted event (engine.mu held).
+// Used only for WAL replay at startup.
 func (e *engine) applyLocked(ev Event) {
 	if ev.Type == evCreated {
 		if _, ok := e.sems[ev.Name]; ok {
@@ -416,29 +588,7 @@ func (e *engine) apply(ev Event) {
 func (e *engine) restore(snap Snapshot) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	s := &semaState{
-		name: snap.Name, permits: snap.Permits, strategy: snap.Strategy,
-		fenceSeq: snap.FenceSeq, eventSeq: snap.Seq,
-		holders: map[string]*Holder{}, waiters: map[string]*Waiter{},
-		notified: map[int64]bool{},
-	}
-	for _, f := range snap.Notified {
-		s.notified[f] = true
-	}
-	for i := range snap.Holders {
-		h := snap.Holders[i]
-		s.holders[h.ID] = &h
-		s.used += h.Count
-	}
-	for i := range snap.Waiters {
-		w := snap.Waiters[i]
-		s.waiters[w.ID] = &w
-		s.queue = append(s.queue, w.ID)
-	}
-	sort.SliceStable(s.queue, func(i, j int) bool {
-		return s.waiters[s.queue[i]].Seq < s.waiters[s.queue[j]].Seq
-	})
-	e.sems[snap.Name] = s
+	e.sems[snap.Name] = semaStateFromSnapshot(snap)
 }
 
 // deepSnapshot returns a deep-copied durable snapshot; caller holds mu.

@@ -2,10 +2,11 @@ package semaphore
 
 import "sort"
 
-// markNotified durably records that a queued grant (identified by waiter id)
-// was delivered to the requesting instance. A restarted owner can then
-// re-push exactly the grants whose delivery was never confirmed, without
-// granting the same permits twice.
+// markNotified records in memory that a queued grant (identified by waiter
+// id) was delivered to the requesting instance. This is best-effort: the
+// flag only suppresses duplicate re-push after a restart, and a re-push is
+// always safe (the waiter is gone or the lease is released idempotently).
+// It therefore does not fsync, avoiding an extra commit on every grant.
 func (e *engine) markNotified(name, waiterID string, fence int64, now int64, save saver) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -20,9 +21,8 @@ func (e *engine) markNotified(name, waiterID string, fence int64, now int64, sav
 		if h.Fence != fence || s.notified[fence] {
 			return nil // superseded by renewal, or already confirmed
 		}
-		ev := Event{Seq: s.eventSeq + 1, At: now, Type: evNotified, Name: name, WaiterID: waiterID, Fence: fence}
-		_, err := e.commit([]Event{ev}, nil, save)
-		return err
+		s.notified[fence] = true
+		return nil
 	}
 	return nil
 }

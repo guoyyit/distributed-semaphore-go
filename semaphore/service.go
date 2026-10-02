@@ -139,7 +139,7 @@ func (i *Instance) isOwner(name string) bool { return i.ownerFor(name) == i.cfg.
 // ---- persistence glue ----
 
 func (i *Instance) save(evs []Event) error {
-	return i.w.append(evs)
+	return i.w.appendSync(evs)
 }
 
 // maybeCompact writes a snapshot once the post-snapshot log crosses the
@@ -294,9 +294,11 @@ func (i *Instance) awaitGrant(ctx context.Context, req *request, owner string) (
 func (i *Instance) awaitRegistered(ctx context.Context, waiterID string, pa *pendingAcquire) (*Lease, error) {
 	select {
 	case l := <-pa.leaseCh:
+		i.unregisterWait(waiterID)
 		i.startLeaseHeartbeat(l)
 		return l, nil
 	case err := <-pa.errCh:
+		i.unregisterWait(waiterID)
 		return nil, err
 	case <-ctx.Done():
 		// Remove the queue slot on the owner first, then unregister locally.
@@ -313,7 +315,9 @@ func (i *Instance) awaitRegistered(ctx context.Context, waiterID string, pa *pen
 			select {
 			case l := <-pa.leaseCh:
 				if l != nil {
-					_ = i.Release(context.Background(), l)
+					fmt.Printf("DEBUG cancel drain releasing holder=%s\n", l.HolderID)
+					rerr := i.Release(context.Background(), l)
+					fmt.Printf("DEBUG cancel drain release result holder=%s err=%v\n", l.HolderID, rerr)
 				}
 			default:
 				return nil, mapCtxErr(ctx.Err())
@@ -623,6 +627,7 @@ func (i *Instance) deliverLocal(waiterID string, l *Lease) {
 		_ = i.engine.markNotified(l.Semaphore, waiterID, l.Fence, i.nowNanos(), i.save)
 		return
 	}
+	fmt.Printf("DEBUG deliverLocal push failed waiter=%s holder=%s releasing\n", waiterID, l.HolderID)
 	go func() { _ = i.Release(context.Background(), l) }()
 }
 
@@ -644,6 +649,7 @@ func (i *Instance) deliverRemote(instance, waiterID string, l *Lease) {
 			}
 			time.Sleep(i.cfg.TickInterval)
 		}
+		fmt.Printf("DEBUG deliverRemote GAVE UP waiter=%s holder=%s\n", waiterID, l.HolderID)
 		// Give up in-memory; the lease will expire and be reclaimed if the
 		// client never comes back, and a restart re-pushes pending grants.
 	}()

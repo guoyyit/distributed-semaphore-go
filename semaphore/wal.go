@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 )
 
 // Per-named-semaphore WAL layout inside an instance's DataDir:
@@ -20,14 +21,30 @@ import (
 // State of a semaphore = its snapshot + its subsequent events. Every append
 // is fsynced before the caller applies the events to memory, so an instance
 // crash never loses a granted permit nor keeps a released one.
+//
+// Group commit: appends are collected by a background flusher and fsynced in
+// a single syscall. Callers still block until their own events are durable,
+// so a grant is never acknowledged before it is on disk, but concurrent
+// commits share one fsync instead of paying one each.
 type wal struct {
 	dir string
 	mu  sync.Mutex
+
+	// group commit
+	cond     *sync.Cond
+	pending  []pendingWrite
+	closed   bool
+	flushing bool
 }
 
 type snapshotEnvelope struct {
 	Version int      `json:"version"`
 	Snap    Snapshot `json:"snapshot"`
+}
+
+type pendingWrite struct {
+	evs  []Event
+	done chan error
 }
 
 func openWAL(dir string) (*wal, error) {
@@ -37,7 +54,90 @@ func openWAL(dir string) (*wal, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
-	return &wal{dir: dir}, nil
+	w := &wal{dir: dir}
+	w.cond = sync.NewCond(&w.mu)
+	go w.flusherLoop()
+	return w, nil
+}
+
+// appendSync durably writes evs, blocking until the group fsync completes.
+func (w *wal) appendSync(evs []Event) error {
+	if len(evs) == 0 || w.dir == "" {
+		return nil
+	}
+	ch := w.append(evs)
+	return <-ch
+}
+
+// append registers evs for the next group flush and returns a completion
+// channel. The caller must not apply the events until the channel signals.
+func (w *wal) append(evs []Event) <-chan error {
+	ch := make(chan error, 1)
+	if len(evs) == 0 || w.dir == "" {
+		ch <- nil
+		return ch
+	}
+	w.mu.Lock()
+	w.pending = append(w.pending, pendingWrite{evs: evs, done: ch})
+	w.cond.Signal()
+	w.mu.Unlock()
+	return ch
+}
+
+// flusherLoop is the single background writer. It collects pending appends,
+// waits a short window to coalesce concurrent commits, then writes and
+// fsyncs every touched name file exactly once per flush.
+func (w *wal) flusherLoop() {
+	const collectWindow = 150 * time.Microsecond
+	for {
+		w.mu.Lock()
+		for len(w.pending) == 0 && !w.closed {
+			w.cond.Wait()
+		}
+		if w.closed && len(w.pending) == 0 {
+			w.mu.Unlock()
+			return
+		}
+		// Coalesce: give concurrent commits a chance to join this flush.
+		if len(w.pending) > 0 {
+			w.mu.Unlock()
+			time.Sleep(collectWindow)
+			w.mu.Lock()
+		}
+		batch := w.pending
+		w.pending = nil
+		w.mu.Unlock()
+
+		err := w.flushBatch(batch)
+		for _, pw := range batch {
+			select {
+			case pw.done <- err:
+			default:
+			}
+		}
+	}
+}
+
+// flushBatch writes all events in the batch to their per-name files and
+// fsyncs each once. Events are already in Seq order (planning is serialized
+// by the engine lock), so the log stays contiguous.
+func (w *wal) flushBatch(batch []pendingWrite) error {
+	byName := map[string][]Event{}
+	var order []string
+	for _, pw := range batch {
+		for _, ev := range pw.evs {
+			if _, ok := byName[ev.Name]; !ok {
+				order = append(order, ev.Name)
+			}
+			byName[ev.Name] = append(byName[ev.Name], ev)
+		}
+	}
+	for _, name := range order {
+		if err := w.appendName(name, byName[name]); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (w *wal) eventFile(name string) string {
@@ -46,29 +146,6 @@ func (w *wal) eventFile(name string) string {
 
 func (w *wal) snapFile(name string) string {
 	return filepath.Join(w.dir, "snapshot-"+sanitize(name)+".json")
-}
-
-func (w *wal) append(evs []Event) error {
-	if len(evs) == 0 || w.dir == "" {
-		return nil
-	}
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	// Group by name; within each group sequences are contiguous.
-	byName := map[string][]Event{}
-	var order []string
-	for _, ev := range evs {
-		if _, ok := byName[ev.Name]; !ok {
-			order = append(order, ev.Name)
-		}
-		byName[ev.Name] = append(byName[ev.Name], ev)
-	}
-	for _, name := range order {
-		if err := w.appendName(name, byName[name]); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 func (w *wal) appendName(name string, evs []Event) error {
@@ -104,7 +181,7 @@ func (w *wal) sinceSnapshot() int {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	max := 0
-	for _, name := range w.listNames() {
+	for _, name := range w.listNamesLocked() {
 		_, evs, err := w.readName(name)
 		if err != nil {
 			continue
@@ -195,7 +272,7 @@ func (w *wal) loadAll() ([]Snapshot, []Event, error) {
 	defer w.mu.Unlock()
 	var snaps []Snapshot
 	var evs []Event
-	for _, name := range w.listNames() {
+	for _, name := range w.listNamesLocked() {
 		snap, nameEvs, err := w.readName(name)
 		if err != nil {
 			return nil, nil, err
@@ -210,7 +287,7 @@ func (w *wal) loadAll() ([]Snapshot, []Event, error) {
 
 // listNames derives semaphore names from snapshot files (always present once
 // a semaphore was created), falling back to event logs.
-func (w *wal) listNames() []string {
+func (w *wal) listNamesLocked() []string {
 	seen := map[string]bool{}
 	entries, err := os.ReadDir(w.dir)
 	if err != nil {
@@ -277,7 +354,16 @@ func (w *wal) readName(name string) (*Snapshot, []Event, error) {
 	return snap, evs, nil
 }
 
-func (w *wal) Close() error { return nil }
+func (w *wal) Close() error {
+	if w.dir == "" {
+		return nil
+	}
+	w.mu.Lock()
+	w.closed = true
+	w.cond.Broadcast()
+	w.mu.Unlock()
+	return nil
+}
 
 // sanitize maps an arbitrary semaphore name to a filesystem-safe token.
 func sanitize(name string) string {
